@@ -1,0 +1,175 @@
+name: CI — Pull Request Checks
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+jobs:
+  ##############################################################################
+  # Backend — Lint + Test
+  ##############################################################################
+  backend-ci:
+    name: Backend (Python / FastAPI)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff black mypy
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Format check with black
+        run: black --check .
+
+      - name: Type check with mypy
+        run: mypy app/ --ignore-missing-imports
+
+      - name: Run tests
+        run: pytest tests/ -v --cov=app --cov-report=xml --cov-report=term-missing
+        env:
+          DATABASE_URL: "postgresql+asyncpg://postgres:postgres@localhost:5432/test_db"
+          SECRET_KEY: "test-secret-key-for-ci"
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: backend
+
+  ##############################################################################
+  # Frontend — Lint + Build
+  ##############################################################################
+  frontend-ci:
+    name: Frontend (React / TypeScript)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test -- --run
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_URL: "https://api.example.com/api/v1"
+
+  ##############################################################################
+  # Terraform — Validate + Plan
+  ##############################################################################
+  terraform-ci:
+    name: Terraform (AWS Infrastructure)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: infra
+
+      - name: Validate VPC module
+        run: |
+          terraform init -backend=false
+          terraform validate
+        working-directory: infra/modules/vpc
+
+      - name: Validate ECS module
+        run: |
+          terraform init -backend=false
+          terraform validate
+        working-directory: infra/modules/ecs
+
+      - name: Validate RDS module
+        run: |
+          terraform init -backend=false
+          terraform validate
+        working-directory: infra/modules/rds
+
+      - name: Validate S3 module
+        run: |
+          terraform init -backend=false
+          terraform validate
+        working-directory: infra/modules/s3
+
+      - name: Terraform Plan (dev)
+        if: github.event_name == 'pull_request'
+        run: |
+          terraform init
+          terraform plan -no-color -out=tfplan
+        working-directory: infra/envs/dev
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        continue-on-error: true  # Plan may fail without real AWS creds in forks
+
+  ##############################################################################
+  # Security — Secrets & SAST scan
+  ##############################################################################
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for secrets with gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
